@@ -22,15 +22,19 @@ jobs:
         run: python trend_collector.py
         env:
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
-      - name: Commit new trends
+      - name: Generate content ideas
+        run: python idea_generator.py
+        env:
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+      - name: Commit new trends and ideas
         run: |
           git config user.name "trend-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add trends/*.jsonl
+          git add trends/*.jsonl ideas/*.jsonl ideas/*.md
           if git diff --cached --quiet; then
             echo "no new trends"
           else
-            git commit -m "trends: update $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            git commit -m "trends+ideas: update $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             for i in 1 2 3; do
               git push && break
               git pull --rebase --autostash origin main || true
