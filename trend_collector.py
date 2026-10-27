@@ -10,14 +10,19 @@
 
 منابع:
   - Google Trends (ایران و آمریکا)
-  - Hacker News (برترین‌های فناوری/هوش مصنوعی)
+  - Google News RSS برای هر حوزه (پایدارترین منبع؛ فارسی و انگلیسی)
+  - Hacker News (با جایگزین Algolia در صورت قطعی firebaseio)
   - Reddit (r/artificial، r/technology، r/CryptoCurrency — برترین‌های ۲۴ ساعت)
   - CoinGecko trending (کریپتو/مالی)
   - YouTube trending (فقط اگر YOUTUBE_API_KEY تنظیم شده باشد؛ منطقه ایران و آمریکا)
+
+هر منبع با try/retry جداگانه اجرا می‌شود؛ قطعی یکی بقیه را از کار نمی‌اندازد.
 """
 
 import json
 import os
+import time
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -29,10 +34,17 @@ UA = (
 )
 
 
-def http_get(url, timeout=25):
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "*/*"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read().decode("utf-8", errors="replace")
+def http_get(url, timeout=25, retries=3):
+    last = None
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "*/*"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read().decode("utf-8", errors="replace")
+        except Exception as exc:
+            last = exc
+            time.sleep(2 * (attempt + 1))
+    raise last
 
 
 def http_get_json(url, timeout=25):
@@ -55,15 +67,19 @@ def record(source, niche, rank, title, **extra):
     return row
 
 
-# ---------- XML helpers (namespace-agnostic) ----------
+# ---------- XML helpers (namespace-agnostic، سازگار با Atom و RSS) ----------
 
 def _local(tag):
     return tag.rsplit("}", 1)[-1].lower()
 
 
-def atom_entries(xml_text):
+def feed_items(xml_text):
     root = ET.fromstring(xml_text)
-    return [el for el in root.iter() if _local(el.tag) == "entry"]
+    items = []
+    for el in root.iter():
+        if _local(el.tag) in ("entry", "item"):
+            items.append(entry_fields(el))
+    return items
 
 
 def entry_fields(entry):
@@ -71,7 +87,7 @@ def entry_fields(entry):
     for child in entry:
         name = _local(child.tag)
         if name == "link":
-            href = child.attrib.get("href")
+            href = child.attrib.get("href") or (child.text or "").strip()
             if href:
                 links.append(href)
         else:
@@ -87,44 +103,94 @@ def entry_fields(entry):
 def google_trends(geo, niche="عمومی/سرگرمی", limit=20):
     xml_text = http_get("https://trends.google.com/trending/rss?geo=" + geo)
     rows = []
-    for i, entry in enumerate(atom_entries(xml_text)[:limit], 1):
-        f = entry_fields(entry)
+    for i, item in enumerate(feed_items(xml_text)[:limit], 1):
+        title = item.get("title", "")
         rows.append(
             record(
                 "google_trends",
                 niche,
                 i,
-                f.get("title", ""),
+                title,
                 geo=geo,
-                approx_traffic=f.get("approx_traffic"),
-                news_title=f.get("news_item_title"),
-                url=(f.get("links") or [None])[0],
+                approx_traffic=item.get("approx_traffic"),
+                news_title=item.get("news_item_title"),
+                url=(item.get("links") or [None])[0],
+            )
+        )
+    return rows
+
+
+def google_news(query, niche, hl="fa", gl="IR", ceid="IR:fa", limit=10):
+    q = urllib.parse.quote(query)
+    url = (
+        "https://news.google.com/rss/search?q=" + q
+        + "&hl=" + hl + "&gl=" + gl + "&ceid=" + ceid
+    )
+    xml_text = http_get(url)
+    rows = []
+    for i, item in enumerate(feed_items(xml_text)[:limit], 1):
+        title = item.get("title", "")
+        if " - " in title:
+            title = title.rsplit(" - ", 1)[0].strip()
+        if not title:
+            continue
+        rows.append(
+            record(
+                "google_news",
+                niche,
+                i,
+                title,
+                url=(item.get("links") or [None])[0],
+                published=item.get("pubdate") or item.get("published"),
+                query=query,
             )
         )
     return rows
 
 
 def hacker_news(limit=20):
-    ids = http_get_json("https://hacker-news.firebaseio.com/v0/topstories.json")[:limit]
-    rows = []
-    for i, item_id in enumerate(ids, 1):
-        item = http_get_json(
-            "https://hacker-news.firebaseio.com/v0/item/" + str(item_id) + ".json"
-        )
-        if not item or not item.get("title"):
-            continue
-        rows.append(
-            record(
-                "hacker_news",
-                "فناوری/هوش مصنوعی",
-                i,
-                item["title"],
-                url=item.get("url"),
-                score=item.get("score"),
-                comments=item.get("descendants"),
+    try:
+        ids = http_get_json("https://hacker-news.firebaseio.com/v0/topstories.json")[:limit]
+        rows = []
+        for i, item_id in enumerate(ids, 1):
+            item = http_get_json(
+                "https://hacker-news.firebaseio.com/v0/item/" + str(item_id) + ".json"
             )
+            if not item or not item.get("title"):
+                continue
+            rows.append(
+                record(
+                    "hacker_news",
+                    "فناوری/هوش مصنوعی",
+                    i,
+                    item["title"],
+                    url=item.get("url"),
+                    score=item.get("score"),
+                    comments=item.get("descendants"),
+                )
+            )
+        return rows
+    except Exception:
+        data = http_get_json(
+            "https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage=" + str(limit)
         )
-    return rows
+        rows = []
+        for i, h in enumerate((data.get("hits") or [])[:limit], 1):
+            title = h.get("title") or h.get("story_title") or ""
+            if not title:
+                continue
+            rows.append(
+                record(
+                    "hacker_news",
+                    "فناوری/هوش مصنوعی",
+                    i,
+                    title,
+                    url=h.get("url"),
+                    score=h.get("points"),
+                    comments=h.get("num_comments"),
+                )
+            )
+        return rows
 
 
 REDDIT_SUBS = [
@@ -137,16 +203,15 @@ REDDIT_SUBS = [
 def reddit_top(sub, niche, limit=10):
     xml_text = http_get("https://www.reddit.com/r/" + sub + "/top/.rss?t=day")
     rows = []
-    for i, entry in enumerate(atom_entries(xml_text)[:limit], 1):
-        f = entry_fields(entry)
+    for i, item in enumerate(feed_items(xml_text)[:limit], 1):
         rows.append(
             record(
                 "reddit",
                 niche,
                 i,
-                f.get("title", ""),
+                item.get("title", ""),
                 sub=sub,
-                url=(f.get("links") or [None])[0],
+                url=(item.get("links") or [None])[0],
             )
         )
     return rows
@@ -213,6 +278,12 @@ def main():
     collectors = [
         ("google_trends_IR", lambda: google_trends("IR")),
         ("google_trends_US", lambda: google_trends("US")),
+        ("google_news_ai_fa", lambda: google_news("هوش مصنوعی", "فناوری/هوش مصنوعی")),
+        ("google_news_tech_fa", lambda: google_news("فناوری روز", "فناوری/هوش مصنوعی")),
+        ("google_news_ai_en", lambda: google_news("artificial intelligence", "فناوری/هوش مصنوعی", hl="en", gl="US", ceid="US:en")),
+        ("google_news_crypto_fa", lambda: google_news("کریپتو بیت کوین", "کریپتو/مالی")),
+        ("google_news_crypto_en", lambda: google_news("bitcoin crypto market", "کریپتو/مالی", hl="en", gl="US", ceid="US:en")),
+        ("google_news_learn_fa", lambda: google_news("آموزش راهنمای ساده", "سرگرمی/آموزشی")),
         ("hacker_news", hacker_news),
     ]
     for sub, niche in REDDIT_SUBS:
